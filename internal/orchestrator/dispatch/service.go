@@ -138,90 +138,114 @@ func (s *Service) Dispatch(ctx context.Context, request DispatchRequest) (Record
 		}
 	}
 
-	workerID := record.WorkerID
-	nodeID := record.Spec.Identity.NodeID
-	if request.WorkerID != "" {
-		if workerID != "" && workerID != request.WorkerID {
-			return record, errors.New("durable workload is already assigned to another Worker")
+	excluded := []string{}
+	for {
+		workerID := record.WorkerID
+		nodeID := record.Spec.Identity.NodeID
+		if request.WorkerID != "" {
+			if workerID != "" && workerID != request.WorkerID {
+				return record, errors.New("durable workload is already assigned to another Worker")
+			}
+			workerID = request.WorkerID
+			nodeID = request.NodeID
 		}
-		workerID = request.WorkerID
-		nodeID = request.NodeID
-	}
-	if workerID == "" {
-		now := s.config.Now().UTC()
-		placement, err := s.scheduler.Select(scheduling.Request{RequiredCapabilities: record.Spec.RequiredCapabilities,
-			Resources: record.Spec.Resources, MaxObservationAge: s.config.MaxObservationAge}, now)
+		schedulerChose := false
+		if workerID == "" {
+			now := s.config.Now().UTC()
+			placement, err := s.scheduler.Select(scheduling.Request{
+				RequiredCapabilities: record.Spec.RequiredCapabilities,
+				Resources:            record.Spec.Resources,
+				MaxObservationAge:    s.config.MaxObservationAge,
+				ExcludedWorkerIDs:    excluded,
+			}, now)
+			if err != nil {
+				return s.terminal(record, StateRejected, "no compatible connected Worker: "+err.Error(), err)
+			}
+			workerID = placement.WorkerID
+			nodeID = placement.NodeID
+			schedulerChose = true
+		}
+		if !s.control.Connected(workerID) {
+			if schedulerChose {
+				excluded = append(excluded, workerID)
+				record.WorkerID = ""
+				continue
+			}
+			return record, errors.New("selected Worker is disconnected; dispatch will be retried")
+		}
+		record.WorkerID = workerID
+		record.Spec.Identity = domain.Identity{OrchestratorID: s.config.OrchestratorID, WorkerID: workerID, NodeID: nodeID}
+		record.State = StateOffered
+		record.UpstreamError = ""
+		record.UpdatedAt = s.config.Now().UTC()
+		if err := s.save(record, "Orchestrator selected Worker and sent workload offer"); err != nil {
+			return record, err
+		}
+		decision, err := s.control.Offer(ctx, workerID, record.Spec)
+		if err != nil || !decision.Accepted {
+			if schedulerChose {
+				excluded = append(excluded, workerID)
+				record.WorkerID = ""
+				record.Spec.Identity.WorkerID = ""
+				record.Spec.Identity.NodeID = ""
+				continue
+			}
+			if err != nil {
+				record.UpstreamError = "WCP offer failed: " + err.Error()
+				record.UpdatedAt = s.config.Now().UTC()
+				_ = s.save(record, "WCP offer failed; dispatch will be retried")
+				return record, err
+			}
+			reason := decision.Reason
+			if reason == "" {
+				reason = "Worker rejected workload"
+			}
+			return s.terminal(record, StateRejected, reason, fmt.Errorf("Worker admission rejected: %s", reason))
+		}
+		if s.scheduler != nil {
+			s.scheduler.NoteReservation(workerID, record.Spec.Resources, s.config.Now().UTC())
+		}
+		record.State = StateReserved
+		record.UpdatedAt = s.config.Now().UTC()
+		if err := s.save(record, "Worker reserved resources"); err != nil {
+			return record, err
+		}
+		if request.BeforeCommit != nil {
+			if err := request.BeforeCommit(ctx, record); err != nil {
+				_ = s.control.Cancel(context.Background(), record.WorkerID, record.Spec.WorkloadID, record.Spec.AttemptID)
+				return s.terminal(record, StateCancelled, "external authority refused commit: "+err.Error(), err)
+			}
+		}
+		if request.Source == SourceBeamCore && s.BatchCancelled(record.BatchID) {
+			_ = s.control.Cancel(ctx, record.WorkerID, record.Spec.WorkloadID, record.Spec.AttemptID)
+			return s.terminal(record, StateCancelled, "batch_cancelled", errors.New("batch_cancelled"))
+		}
+		token, err := randomToken(24)
 		if err != nil {
-			return s.terminal(record, StateRejected, "no compatible connected Worker: "+err.Error(), err)
+			return record, err
 		}
-		workerID = placement.WorkerID
-		nodeID = placement.NodeID
-	}
-	if !s.control.Connected(workerID) {
-		return record, errors.New("selected Worker is disconnected; dispatch will be retried")
-	}
-	record.WorkerID = workerID
-	record.Spec.Identity = domain.Identity{OrchestratorID: s.config.OrchestratorID, WorkerID: workerID, NodeID: nodeID}
-	record.State = StateOffered
-	record.UpstreamError = ""
-	record.UpdatedAt = s.config.Now().UTC()
-	if err := s.save(record, "Orchestrator selected Worker and sent workload offer"); err != nil {
-		return record, err
-	}
-	decision, err := s.control.Offer(ctx, workerID, record.Spec)
-	if err != nil {
-		record.UpstreamError = "WCP offer failed: " + err.Error()
-		record.UpdatedAt = s.config.Now().UTC()
-		_ = s.save(record, "WCP offer failed; dispatch will be retried")
-		return record, err
-	}
-	if !decision.Accepted {
-		reason := decision.Reason
-		if reason == "" {
-			reason = "Worker rejected workload"
+		expiresAt := s.config.Now().Add(s.config.AssignmentTTL).UTC()
+		if !record.Spec.Lease.AssignmentExpiresAt.IsZero() && record.Spec.Lease.AssignmentExpiresAt.Before(expiresAt) {
+			expiresAt = record.Spec.Lease.AssignmentExpiresAt
 		}
-		return s.terminal(record, StateRejected, reason, fmt.Errorf("Worker admission rejected: %s", reason))
-	}
-	record.State = StateReserved
-	record.UpdatedAt = s.config.Now().UTC()
-	if err := s.save(record, "Worker reserved resources"); err != nil {
-		return record, err
-	}
-	if request.BeforeCommit != nil {
-		if err := request.BeforeCommit(ctx, record); err != nil {
+		commit := domain.Commit{WorkloadID: record.Spec.WorkloadID, AttemptID: record.Spec.AttemptID,
+			PlanVersion: 1, AssignmentToken: token, AssignmentExpiresAt: expiresAt}
+		if err := s.control.Commit(ctx, record.WorkerID, commit); err != nil {
 			_ = s.control.Cancel(context.Background(), record.WorkerID, record.Spec.WorkloadID, record.Spec.AttemptID)
-			return s.terminal(record, StateCancelled, "external authority refused commit: "+err.Error(), err)
+			record.UpstreamError = "WCP commit failed: " + err.Error()
+			record.UpdatedAt = s.config.Now().UTC()
+			_ = s.save(record, "WCP commit failed; dispatch will be retried")
+			return record, err
 		}
-	}
-	if request.Source == SourceBeamCore && s.BatchCancelled(record.BatchID) {
-		_ = s.control.Cancel(ctx, record.WorkerID, record.Spec.WorkloadID, record.Spec.AttemptID)
-		return s.terminal(record, StateCancelled, "batch_cancelled", errors.New("batch_cancelled"))
-	}
-	token, err := randomToken(24)
-	if err != nil {
-		return record, err
-	}
-	expiresAt := s.config.Now().Add(s.config.AssignmentTTL).UTC()
-	if !record.Spec.Lease.AssignmentExpiresAt.IsZero() && record.Spec.Lease.AssignmentExpiresAt.Before(expiresAt) {
-		expiresAt = record.Spec.Lease.AssignmentExpiresAt
-	}
-	commit := domain.Commit{WorkloadID: record.Spec.WorkloadID, AttemptID: record.Spec.AttemptID,
-		PlanVersion: 1, AssignmentToken: token, AssignmentExpiresAt: expiresAt}
-	if err := s.control.Commit(ctx, record.WorkerID, commit); err != nil {
-		_ = s.control.Cancel(context.Background(), record.WorkerID, record.Spec.WorkloadID, record.Spec.AttemptID)
-		record.UpstreamError = "WCP commit failed: " + err.Error()
+		record.State = StateCommitted
+		record.AssignmentExpiresAt = expiresAt
+		record.Spec.Lease.AssignmentExpiresAt = expiresAt
 		record.UpdatedAt = s.config.Now().UTC()
-		_ = s.save(record, "WCP commit failed; dispatch will be retried")
-		return record, err
+		if err := s.save(record, "workload committed over WCP"); err != nil {
+			return record, err
+		}
+		return record, nil
 	}
-	record.State = StateCommitted
-	record.AssignmentExpiresAt = expiresAt
-	record.Spec.Lease.AssignmentExpiresAt = expiresAt
-	record.UpdatedAt = s.config.Now().UTC()
-	if err := s.save(record, "workload committed over WCP"); err != nil {
-		return record, err
-	}
-	return record, nil
 }
 
 func (s *Service) HandleProgress(progress domain.Progress) error {

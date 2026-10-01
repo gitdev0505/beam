@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	orchestratordomain "github.com/Beam-Network/beam/internal/orchestrator/domain"
@@ -33,11 +34,84 @@ type Placement struct {
 	Rejected []Rejection
 }
 
+type reservation struct {
+	resources workload.Resources
+	at        time.Time
+}
+
 type Scheduler struct {
 	registry *registry.Registry
+
+	mu           sync.Mutex
+	reservations map[string][]reservation
 }
 
 func New(registry *registry.Registry) *Scheduler { return &Scheduler{registry: registry} }
+
+// NoteReservation records resources just handed to a worker. Select subtracts
+// reservations newer than that worker's last heartbeat, because the heartbeat
+// still reports the old free capacity for up to one interval. Safe on a nil
+// or zero-value scheduler.
+func (s *Scheduler) NoteReservation(workerID string, resources workload.Resources, at time.Time) {
+	if s == nil || workerID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reservations == nil {
+		s.reservations = map[string][]reservation{}
+	}
+	s.pruneReservationsLocked(at)
+	s.reservations[workerID] = append(s.reservations[workerID], reservation{resources: resources, at: at})
+}
+
+func (s *Scheduler) pruneReservationsLocked(now time.Time) {
+	cutoff := now.Add(-30 * time.Second)
+	for workerID, pending := range s.reservations {
+		kept := pending[:0]
+		for _, item := range pending {
+			if item.at.After(cutoff) {
+				kept = append(kept, item)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.reservations, workerID)
+			continue
+		}
+		s.reservations[workerID] = kept
+	}
+}
+
+func (s *Scheduler) reservationsFor(workerID string, now time.Time) []reservation {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneReservationsLocked(now)
+	pending := s.reservations[workerID]
+	if len(pending) == 0 {
+		return nil
+	}
+	return append([]reservation(nil), pending...)
+}
+
+func applyReservations(observation orchestratordomain.WorkerObservation, pending []reservation) orchestratordomain.WorkerObservation {
+	if len(pending) == 0 {
+		return observation
+	}
+	// A reservation within 1s before the heartbeat still counts. The heartbeat
+	// can be timestamped just before the offer it has not reported yet.
+	cutoff := observation.ObservedAt.Add(-time.Second)
+	var used workload.Resources
+	for _, item := range pending {
+		if !item.at.Before(cutoff) {
+			used = used.Add(item.resources)
+		}
+	}
+	observation.Available = observation.Available.SubFloor(used)
+	return observation
+}
 
 func (s *Scheduler) Select(request Request, now time.Time) (Placement, error) {
 	if request.MaxObservationAge <= 0 {
@@ -50,6 +124,7 @@ func (s *Scheduler) Select(request Request, now time.Time) (Placement, error) {
 	var candidates []candidate
 	placement := Placement{}
 	for _, observation := range s.registry.Observations() {
+		observation = applyReservations(observation, s.reservationsFor(observation.WorkerID, now))
 		reason := rejectionReason(observation, request, now)
 		if reason != "" {
 			placement.Rejected = append(placement.Rejected, Rejection{WorkerID: observation.WorkerID, Reason: reason})

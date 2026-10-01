@@ -320,14 +320,19 @@ func (control *roomControl) handleTaskOfferBatch(ctx context.Context, encoded []
 		}
 		specs = append(specs, spec)
 	}
+	var dispatchErr error
 	for _, spec := range specs {
-		if _, err := control.tasks.Dispatch(ctx, dispatch.DispatchRequest{
+		record, err := control.tasks.Dispatch(ctx, dispatch.DispatchRequest{
 			Source: dispatch.SourceBeamCore, ExternalID: spec.AttemptID, BatchID: batch.BatchID, Spec: spec,
-		}); err != nil {
-			return err
+		})
+		if err != nil {
+			log.Printf("task offer dispatch batch_id=%s offer_id=%s worker_id=%s error=%v", batch.BatchID, spec.AttemptID, record.WorkerID, err)
+			dispatchErr = errors.Join(dispatchErr, fmt.Errorf("offer %s: %w", spec.AttemptID, err))
+			continue
 		}
+		log.Printf("task offer dispatch batch_id=%s offer_id=%s worker_id=%s", batch.BatchID, spec.AttemptID, record.WorkerID)
 	}
-	return nil
+	return dispatchErr
 }
 
 func (control *roomControl) handleCancel(ctx context.Context, encoded []byte) error {
