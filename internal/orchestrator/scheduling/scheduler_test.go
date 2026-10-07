@@ -121,6 +121,53 @@ func TestReservationOlderThan30SecondsIsDropped(t *testing.T) {
 	}
 }
 
+func TestMeasuredFastWorkerKeepsTheBatch(t *testing.T) {
+	at := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	reg := testRegistry(t)
+	observe(t, reg, "worker-fast", 10, at)
+	observe(t, reg, "worker-slow", 10, at)
+	scheduler := New(reg)
+	now := at.Add(time.Second)
+	scheduler.NoteSample("worker-fast", chunkBytes, 2*time.Second, now)
+	scheduler.NoteSample("worker-slow", chunkBytes, 20*time.Second, now)
+	resources := chunkRequest().Resources
+
+	for step := 0; step < 3; step++ {
+		placement, err := scheduler.Select(chunkRequest(), now)
+		if err != nil || placement.WorkerID != "worker-fast" {
+			t.Fatalf("step %d placement=%+v err=%v", step, placement, err)
+		}
+		scheduler.NoteReservation("worker-fast", resources, now)
+	}
+}
+
+func TestUnmeasuredWorkerGetsOneOfferAfterFastWorkerIsFull(t *testing.T) {
+	at := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	reg := testRegistry(t)
+	observe(t, reg, "worker-fast", 1, at)
+	observe(t, reg, "worker-new", 10, at)
+	scheduler := New(reg)
+	now := at.Add(time.Second)
+	scheduler.NoteSample("worker-fast", chunkBytes, 2*time.Second, now)
+	resources := chunkRequest().Resources
+
+	first, err := scheduler.Select(chunkRequest(), now)
+	if err != nil || first.WorkerID != "worker-fast" {
+		t.Fatalf("first placement=%+v err=%v", first, err)
+	}
+	scheduler.NoteReservation("worker-fast", resources, now)
+
+	second, err := scheduler.Select(chunkRequest(), now)
+	if err != nil || second.WorkerID != "worker-new" {
+		t.Fatalf("second placement=%+v err=%v", second, err)
+	}
+	scheduler.NoteReservation("worker-new", resources, now)
+
+	if _, err := scheduler.Select(chunkRequest(), now); err != ErrNoCandidate {
+		t.Fatalf("third placement err=%v", err)
+	}
+}
+
 func TestNoteReservationOnNilScheduler(t *testing.T) {
 	var scheduler *Scheduler
 	scheduler.NoteReservation("worker-a", chunkRequest().Resources, time.Now())

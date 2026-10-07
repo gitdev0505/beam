@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Beam-Network/beam/internal/orchestrator/dispatch"
@@ -349,18 +350,29 @@ func (control *roomControl) handleTaskOfferBatch(ctx context.Context, encoded []
 		}
 		specs = append(specs, spec)
 	}
-	var dispatchErr error
+	var (
+		dispatchErr error
+		errMu       sync.Mutex
+		ready       sync.WaitGroup
+	)
 	for _, spec := range specs {
-		record, err := control.tasks.Dispatch(ctx, dispatch.DispatchRequest{
-			Source: dispatch.SourceBeamCore, ExternalID: spec.AttemptID, BatchID: batch.BatchID, Spec: spec,
-		})
-		if err != nil {
-			log.Printf("task offer dispatch batch_id=%s offer_id=%s worker_id=%s error=%v", batch.BatchID, spec.AttemptID, record.WorkerID, err)
-			dispatchErr = errors.Join(dispatchErr, fmt.Errorf("offer %s: %w", spec.AttemptID, err))
-			continue
-		}
-		log.Printf("task offer dispatch batch_id=%s offer_id=%s worker_id=%s", batch.BatchID, spec.AttemptID, record.WorkerID)
+		ready.Add(1)
+		go func(spec domain.Spec) {
+			defer ready.Done()
+			record, err := control.tasks.Dispatch(ctx, dispatch.DispatchRequest{
+				Source: dispatch.SourceBeamCore, ExternalID: spec.AttemptID, BatchID: batch.BatchID, Spec: spec,
+			})
+			if err != nil {
+				log.Printf("task offer dispatch batch_id=%s offer_id=%s worker_id=%s error=%v", batch.BatchID, spec.AttemptID, record.WorkerID, err)
+				errMu.Lock()
+				dispatchErr = errors.Join(dispatchErr, fmt.Errorf("offer %s: %w", spec.AttemptID, err))
+				errMu.Unlock()
+				return
+			}
+			log.Printf("task offer dispatch batch_id=%s offer_id=%s worker_id=%s", batch.BatchID, spec.AttemptID, record.WorkerID)
+		}(spec)
 	}
+	ready.Wait()
 	return dispatchErr
 }
 

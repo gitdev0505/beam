@@ -2,6 +2,7 @@ package connectors
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,12 +16,23 @@ import (
 )
 
 type batchControl struct {
+	mu            sync.Mutex
 	rejectAttempt string
 	offered       []string
+	entered       chan struct{}
+	release       chan struct{}
 }
 
 func (c *batchControl) Offer(_ context.Context, workerID string, spec domain.Spec) (runtime.Decision, error) {
+	if c.entered != nil {
+		c.entered <- struct{}{}
+	}
+	if c.release != nil {
+		<-c.release
+	}
+	c.mu.Lock()
 	c.offered = append(c.offered, workerID+"/"+spec.AttemptID)
+	c.mu.Unlock()
 	if spec.AttemptID == c.rejectAttempt {
 		return runtime.Decision{Reason: "insufficient resource capacity"}, nil
 	}
@@ -101,7 +113,11 @@ func TestTaskOfferBatchContinuesAfterRejectedOffer(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the rejected offer to be reported")
 	}
-	if len(control.offered) != 2 || control.offered[0] != "worker-a/bad" || control.offered[1] != "worker-a/good" {
+	offered := map[string]bool{}
+	for _, item := range control.offered {
+		offered[item] = true
+	}
+	if len(control.offered) != 2 || !offered["worker-a/bad"] || !offered["worker-a/good"] {
 		t.Fatalf("offers=%v err=%v", control.offered, err)
 	}
 	good, ok := tasks.Record("good/good")
@@ -120,5 +136,25 @@ func TestTaskOfferBatchSpreadsAcrossWorkers(t *testing.T) {
 	second, _ := tasks.Record("two/two")
 	if first.WorkerID == "" || second.WorkerID == "" || first.WorkerID == second.WorkerID {
 		t.Fatalf("workers %s and %s", first.WorkerID, second.WorkerID)
+	}
+}
+
+func TestTaskOfferBatchDispatchesOffersTogether(t *testing.T) {
+	control := &batchControl{entered: make(chan struct{}), release: make(chan struct{})}
+	tasks := batchTasks(t, control, []string{"worker-a", "worker-b"})
+	done := make(chan error, 1)
+	go func() {
+		done <- (&roomControl{tasks: tasks}).handleTaskOfferBatch(context.Background(), encodeOffers(t, "one", "two"))
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-control.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("offers were dispatched one at a time")
+		}
+	}
+	close(control.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

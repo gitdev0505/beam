@@ -152,7 +152,7 @@ func (s *Service) Dispatch(ctx context.Context, request DispatchRequest) (Record
 		schedulerChose := false
 		if workerID == "" {
 			now := s.config.Now().UTC()
-			placement, err := s.scheduler.Select(scheduling.Request{
+			placement, err := s.scheduler.Reserve(scheduling.Request{
 				RequiredCapabilities: record.Spec.RequiredCapabilities,
 				Resources:            record.Spec.Resources,
 				MaxObservationAge:    s.config.MaxObservationAge,
@@ -167,6 +167,7 @@ func (s *Service) Dispatch(ctx context.Context, request DispatchRequest) (Record
 		}
 		if !s.control.Connected(workerID) {
 			if schedulerChose {
+				s.scheduler.ReleaseReservation(workerID, record.Spec.Resources)
 				excluded = append(excluded, workerID)
 				record.WorkerID = ""
 				continue
@@ -179,11 +180,15 @@ func (s *Service) Dispatch(ctx context.Context, request DispatchRequest) (Record
 		record.UpstreamError = ""
 		record.UpdatedAt = s.config.Now().UTC()
 		if err := s.save(record, "Orchestrator selected Worker and sent workload offer"); err != nil {
+			if schedulerChose {
+				s.scheduler.ReleaseReservation(workerID, record.Spec.Resources)
+			}
 			return record, err
 		}
 		decision, err := s.control.Offer(ctx, workerID, record.Spec)
 		if err != nil || !decision.Accepted {
 			if schedulerChose {
+				s.scheduler.ReleaseReservation(workerID, record.Spec.Resources)
 				excluded = append(excluded, workerID)
 				record.WorkerID = ""
 				record.Spec.Identity.WorkerID = ""
@@ -201,9 +206,6 @@ func (s *Service) Dispatch(ctx context.Context, request DispatchRequest) (Record
 				reason = "Worker rejected workload"
 			}
 			return s.terminal(record, StateRejected, reason, fmt.Errorf("Worker admission rejected: %s", reason))
-		}
-		if s.scheduler != nil {
-			s.scheduler.NoteReservation(workerID, record.Spec.Resources, s.config.Now().UTC())
 		}
 		record.State = StateReserved
 		record.UpdatedAt = s.config.Now().UTC()
@@ -316,6 +318,9 @@ func (s *Service) HandleResult(ctx context.Context, result domain.Result) error 
 	switch result.State {
 	case domain.StateCompleted, domain.StateReceiptCommitted:
 		record.State = StateCompleted
+		if s.scheduler != nil && result.BytesProcessed > 0 && result.CompletedAt.After(result.StartedAt) {
+			s.scheduler.NoteSample(record.WorkerID, result.BytesProcessed, result.CompletedAt.Sub(result.StartedAt), result.CompletedAt)
+		}
 	case domain.StateCancelled, domain.StateExpired:
 		record.State = StateCancelled
 	default:
